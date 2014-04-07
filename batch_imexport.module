@@ -1,0 +1,562 @@
+<?php
+//$Id$
+/**
+ * @file
+ * 这个模块主要用来实现batch api的使用，进行文件的批量导入和导出
+ *
+ */
+
+
+/**
+ * Implements hook_permission().
+ */
+function batch_imexport_permission() {
+  $perms = array(
+    'batch import csv file' => array(
+      'title' => t('batch import csv file'),
+    ),
+     'batch export csv file' => array(
+       'title' => t('batch export csv file'),
+     ),
+  );
+
+  return $perms;
+}
+/**
+ * Implements hook_menu().
+ */
+function batch_imexport_menu() {
+  $items['batch_import'] = array(
+    'title' => 'Import csv file',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('batch_import_csv'),
+    'access arguments' => array('batch import csv file'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['batch_export'] = array(
+    'title' => 'Export csv file',
+    'page callback' => 'batch_export_csv',
+    'access arguments' => array('batch export csv file'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['batch_export_v2'] = array(
+    'title' => 'Export csv file',
+    'page callback' => 'batch_export_csv_v2',
+    'access arguments' => array('batch export csv file'),
+    'type' => MENU_CALLBACK,
+  );
+  $items['batch_export_download_interm/%'] = array(
+    'title' => 'download csv file',
+    'page callback' => 'batch_imexport_download_csv_file_interim',
+    'page arguments' => array(1),
+    'access arguments' => array('batch export csv file'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  $items['batch_export_download'] = array(
+    'title' => 'download csv file',
+    'page callback' => 'batch_imexport_download_csv_file',
+    'access arguments' => array('batch export csv file'),
+    'type' => MENU_LOCAL_TASK,
+  );
+  return $items;
+}
+/**
+ * Page callback: Form constructor for the import csv
+ * @param $form
+ * @param $form_state
+ */
+function batch_import_csv($form, $form_state) {
+  $form ['notes'] = array (
+      '#type' => 'markup',
+      '#markup' => '<div class="import-notes">A few notes when uploading. <ul><li>Make sure the file is in a .csv format.</li><li>Columns should be in *this* order</li><li>Be sure to click the "Upload" button when you select a csv.</li></ul></div>',
+  );
+  $form ['import'] = array (
+      '#title' => t ( 'Import' ),
+      '#type' => 'managed_file',
+      '#description' => t ( 'The uploaded csv will be imported and temporarily saved.' ),
+      '#upload_location' => 'public://tmp/',
+      '#upload_validators' => array (
+          'file_validate_extensions' => array (
+              'csv'
+          )
+      )
+  );
+  $form ['submit'] = array (
+      '#type' => 'submit',
+      '#value' => t ( 'Submit' )
+  );
+  return $form;
+}
+
+/**
+ * Submit handler for module_name_import_form()
+ */
+function batch_import_csv_submit($form, $form_state) {
+
+  // Check to make sure that the file was uploaded to the server properly
+  $uri = db_query ( "SELECT uri FROM {file_managed} WHERE fid = :fid", array (
+      ':fid' => $form_state ['input'] ['import'] ['fid'] //上传的文件的fid
+  ))->fetchField();
+
+  if (! empty ( $uri )) {
+    if (file_exists ( drupal_realpath ( $uri ) )) {//获取真实路径
+      // Open the csv
+      $handle = fopen ( drupal_realpath ( $uri ), "r" );
+      // Go through each row in the csv and run a function on it. In this case we are parsing by '|' (pipe) characters.
+      // If you want commas are any other character, replace the pipe with it.
+      while ( ($data = fgetcsv ( $handle, 0, ',' )) !== FALSE ) {
+        $operations [] = array (
+            'batch_imexport_import_batch_processing',
+            // The function to run on each row
+            array ( $data ),  // The row in the csv
+        );
+      }
+      drupal_set_message(
+        t('There are @row_count rows so will require @row_count HTTP requests.',
+          array('@row_count' => count($operations),))
+      );
+      // Once everything is gathered and ready to be processed... well... process it!
+      $batch = array (
+          'title' => t ( 'Importing CSV...' ),
+          'operations' => $operations, // Runs all of the queued processes from the while loop above.
+          'finished' => 'batch_imexport_import_finished', // Function to run when the import is successful
+          // Message displayed while processing the batch. Available placeholders are:
+          // @current, @remaining, @total, @percentage, @estimate and @elapsed.
+          // These placeholders are replaced with actual values in _batch_process(),
+          // using strtr() instead of t(). The values are determined based on the
+          // number of operations in the 'operations' array (above), NOT by the number
+          // of nodes that will be processed. In this example, there are 20
+          // operations, so @total will always be 20, even though there are multiple
+          // nodes per operation.
+          // Defaults to t('Completed @current of @total.').
+          'init_message' => t('Import is starting.'),
+          'error_message' => t ( 'The import has encountered an error.' ),
+          'progress_message' => t ( 'Imported @current of @total records.' )
+      );
+      batch_set ( $batch );
+      fclose ( $handle );
+    }
+  } else {
+    drupal_set_message ( t ( 'There was an error uploading your file. Please contact a System administator.' ), 'error' );
+  }
+}
+
+
+/**
+ * This function runs the batch processing and creates nodes with then given information
+ * @see
+ * module_name_import_form_submit()
+ */
+function batch_imexport_import_batch_processing($data, &$context) {
+  // Lets make the variables more readable.
+  $title = $data[0];
+  $body = $data[1];
+  $serial_num = $data[2];
+  // Find out if the node already exists by looking up its serial number. Each serial number should be unique. You can use whatever you want.
+  $nid = db_query("SELECT DISTINCT n.nid FROM {node} n " .
+    "WHERE n.nid = :nid", array(
+      ':nid' => $serial_num,
+    ))->fetchField();
+  if(!empty($nid)) {
+    // The node exists! Load it.
+     $node = node_load($nid);
+     $context['message']= check_plain($node->title);
+//     // Change the values. No need to update the serial number though.
+//     $node->title = $title;
+//     $node->body['und'][0]['value'] = $body;
+//     $node->body['und'][0]['safe_value'] = check_plain($body);
+//     node_save($node);
+
+  }
+  else {
+    // The node does not exist! Create it.
+    global $user;
+    $node = new stdClass();
+    $node->type = 'page'; // Choose your type
+    node_object_prepare($node); // Set some default values
+    // If you update an existing node instead of creating a new one,
+    // comment out the three lines above and uncomment the following:
+    // $node = node_load($nid); // ...where $nid is the node id
+
+
+    $node->status = 1; // Sets to published automatically, 0 will be unpublished
+    $node->title = $title;
+    $node->language = 'zh-hans'; //这里是你的默认的语种
+
+    $node->uid = $user->uid;
+    $node->body[LANGUAGE_NONE][0]['value'] = $body; //这里必须是LANGUAGE_NONE
+    $node->body[LANGUAGE_NONE][0]['summary'] = text_summary($body);
+    $node->body[LANGUAGE_NONE][0]['format'] ='filtered_html';
+    // I prefer using pathauto, which would override the below path
+    //$path = 'node_created_on' . date('YmdHis');
+    //$node->path = array('alias' => $path);
+
+    //$node->field_serial_number['und'][0]['value'] = $serial_num;
+    //$node->field_serial_number['und'][0]['safe_value'] = check_plain($serial_num);
+
+    if($node = node_submit($node)) { // Prepare node for saving
+      node_save($node);
+      //echo "Node with nid " . $node->nid . " saved!\n";
+    }
+
+  }
+}
+
+/**
+ * This function runs when the batch processing is complete
+ *
+ * @see
+ * module_name_import_form_submit()
+ */
+function batch_imexport_import_finished($success, $results, $operations) {
+  if ($success) {
+    // Here we could do something meaningful with the results.
+    drupal_set_message(t('Import Completed Successfully'));
+  }
+  else {
+    // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    drupal_set_message(
+      t('An error occurred while processing @operation with arguments : @args',
+        array(
+          '@operation' => $error_operation[0],
+          '@args' => print_r($error_operation[0], TRUE),
+        )
+      )
+    );
+  }
+
+}
+/**
+ * 批量导出函数，只定义一个操作函数
+ */
+function batch_export_csv(){
+  $operations = array();
+  $operations[] = array(
+      'batch_imexport_export_list_nodes_batch',
+      array(), //没有参数也必须写一个array，不用些$context
+    );
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 'batch_imexport_export_list_nodes_finished',
+    // Message displayed while processing the batch. Available placeholders are:
+    // @current, @remaining, @total, @percentage, @estimate and @elapsed.
+    // These placeholders are replaced with actual values in _batch_process(),
+    // using strtr() instead of t(). The values are determined based on the
+    // number of operations in the 'operations' array (above), NOT by the number
+    // of nodes that will be processed. In this example, there are 20
+    // operations, so @total will always be 20, even though there are multiple
+    // nodes per operation.
+    // Defaults to t('Completed @current of @total.').
+    'title' => t('Exporting all node'),
+    'init_message' => t('Export is starting.'),
+    'progress_message' => t('Processed @current out of @total.'),
+    'error_message' => t('Export has encountered an error.'),
+  );
+  batch_set($batch);
+  batch_process('batch_export_download_interm/v1');
+}
+
+/**
+ * 这里同意采用这一个batch函数处理，其实可以在batch_export_csv中
+ * 对每个node（或多个）生成一个operation，
+ * 这样在界面上展示比较好
+ * Batch operation to export list subscribers.
+ */
+function batch_imexport_export_list_nodes_batch(&$context) {
+
+  // Start working on a set of results.
+  $limit = 5;
+  $context['finished'] = 0; //通过设置finished为1或不设置来表示这个操作已经完成了。见 https://drupal.org/node/1481814
+
+  // Create the CSV file with the appropriate column headers for this
+  // list/network if it hasn't been created yet, and store the file path and
+  // field data in the $context for later retrieval.
+  if (!isset($context['sandbox']['file'])) {
+
+    // Get field names for this list/network. (I use a helper function here).
+    $field_labels = array(
+      'node title',
+      'node body',
+      'node nid',
+      'Created',
+    );
+
+    // Create the file and print the labels in the header row.
+    $filename = 'list_all_nodes_export.csv';
+    $file_path = file_directory_temp() . '/' . $filename;
+    $handle = fopen($file_path, 'w'); // Create the file.
+    fputcsv($handle, $field_labels); // Write the labels to the header row.
+    fclose($handle);
+
+    $fields = array(
+    	'title',
+        'body',//body后面需要特殊处理下
+        'nid',
+        'created',
+    );
+    // Store file path, fields, subscribers, and network in $context.
+    $context['sandbox']['file'] = $file_path;
+    $context['sandbox']['fields'] = $fields;
+    // 如果节点数目太大，可以考虑优化下实现
+    // 在这里可以首先获取nid的总个数（记录到nodes_total）,然后在下面的每次处理前查询记录需要处理的nid的列表
+    // 并记录下当前处理的最大值currten_max。如果查到的记录数不够limit或这查询结果为空，则finished
+    $context['sandbox']['nodes'] = batch_imexport_retrieve_list_nodes();
+    $context['sandbox']['nodes_total'] = count($context['sandbox']['nodes']) - 1;
+
+    // Store some values in the results array for processing when finshed.
+    $context['results']['filename'] = $filename;
+    $context['results']['file'] = $file_path;
+  }
+
+  // Accounting.
+  if (!isset($context['results']['count'])) {
+    $context['results']['count'] = 0;
+  }
+
+  // Open the file for writing ('a' puts pointer at end of file).
+  $handle = fopen($context['sandbox']['file'], 'a');
+
+  // Loop until we hit the batch limit.
+  for ($i = 0; $i < $limit; $i++) {
+    $number_remaining = count($context['sandbox']['nodes']) - 1;
+
+    if ($number_remaining) {
+      $nid = $context['sandbox']['nodes'][$context['results']['count']];
+      // I use a helper function to get the data for each node.
+      $node_data = batch_imexport_retrieve_data_for_export($nid, $context['sandbox']['fields']);
+      fputcsv($handle, $node_data);
+
+      // Remove the uid from $context.
+      // 这里去掉这些记录，防止重复处理。或者采用记录当前处理的index也可以
+      unset($context['sandbox']['nodes'][$context['results']['count']]);
+
+      // Increment the counter.
+      $context['results']['count']++;
+      $context['finished'] = $context['results']['count'] / $context['sandbox']['nodes_total'];
+    }
+    // If there are no nodes remaining, we're finished.
+    else {
+      $context['finished'] = 1;
+      break;
+    }
+  }
+
+  // Close the file.
+  fclose($handle);
+
+  // Show message updating user on how many subscribers have been exported.
+  $context['message'] = t('Exported @count of @total nodes.', array(
+    '@count' => $context['results']['count'],
+    '@total' => $context['sandbox']['nodes_total'],
+  ));
+}
+
+
+/**
+* Finish the export.
+*/
+function batch_imexport_export_list_nodes_finished($success, $results, $operations) {
+  // The 'success' parameter means no fatal PHP errors were detected. All
+  // other error management should be handled using 'results'.
+  if ($success) {
+    $message = format_plural($results['count'], 'One node exported.', '@count nodes exported.');
+  }
+  else {
+     // An error occurred.
+    // $operations contains the operations that remained unprocessed.
+    $error_operation = reset($operations);
+    drupal_set_message(
+      t('An error occurred while processing @operation with arguments : @args',
+        array(
+          '@operation' => $error_operation[0],
+          '@args' => print_r($error_operation[0], TRUE),
+        )
+      )
+    );
+  }
+  drupal_set_message($message, 'warning');
+
+  // Set some session variables for the redirect to the file download page.
+  $_SESSION['csv_download_file'] = $results['file'];
+  $_SESSION['csv_download_filename'] = $results['filename'];
+}
+
+/**
+* Interim download step for downloading CSV file.
+* $end_flag 这个是返回网址的后缀
+*/
+function batch_imexport_download_csv_file_interim($vs) {
+  $end_flag = ($vs == 'v2') ? '_v2' : '';
+
+  global $base_url;
+
+  if (empty($_SESSION['csv_download_filename']) || empty($_SESSION['csv_download_file'])) {
+    return t('Please visit your export page to begin a list download.');
+  }
+
+  // Redirect to the download file.
+  $redirect = base_path() . 'batch_export_download';
+  drupal_add_js('setTimeout(function() { window.location.href = "' . $redirect . '"; }, 2000);', 'inline');
+
+  $download_link = l(t('click here to download the file'), 'batch_export_download');
+  $output = '<p>' . t('Your nodes list is now ready for download. The download should begin automatically. If it does not begin downloading within 5 seconds, please !download_link.', array('!download_link' => $download_link)) . '</p>';
+  $output .= '<p>' . l(t("Back to export page"), 'batch_export'.$end_flag) . '</p>';
+  return $output;
+}
+
+/**
+* Download a list node CSV file.
+*/
+function batch_imexport_download_csv_file() {
+  // For added security, make sure the beginning of the path is the same as that
+  // returned by file_directory_temp() (to prevent users from gaining access to
+  // arbitrary files on the server).
+  if (strpos($_SESSION['csv_download_file'], file_directory_temp()) !== 0) {
+    return 'Access denied.';
+  }
+
+  // Add HTTP headers for CSV file download.
+  drupal_add_http_header('Content-Type', 'text/csv; utf-8');
+  drupal_add_http_header('Content-Disposition', 'attachment; filename=' . $_SESSION['csv_download_filename'], TRUE);
+
+  // Allow caching, otherwise IE users can't dl over SSL (see issue #294).
+  drupal_add_http_header('Cache-Control', 'max-age=300; must-revalidate');
+
+  // Read the file to the output buffer and exit.
+  readfile($_SESSION['csv_download_file']);
+  exit;
+}
+/**
+ * 获取所有节点的id列表
+ */
+function  batch_imexport_retrieve_list_nodes() {
+  $query_nodes = db_select('node', 'n')
+        ->fields('n', array('nid'))
+//         ->condition('nid', $lowest_nid,'>=')
+        ->execute();
+  $nids = array();
+  foreach ($query_nodes as $node){
+    $nids[]=$node->nid;
+  }
+  return $nids;
+
+}
+/**
+ * 根据节点ID，输出域信息构造返回结果
+ * @param  $nid
+ * @param  $fields
+ */
+function batch_imexport_retrieve_data_for_export($nid, $fields){
+  $node = node_load($nid);
+  $node_data = array();
+  foreach ($fields as $field){
+    if($field == 'body'){
+      //body特殊处理一下
+      $node_data[] = $node->body['und'][0]['value'];
+    } else if($field == 'created'){
+      //使用long类型输出日期
+      $node_data[] =format_date($node->$field,'long');
+    } else {
+      $node_data[] = $node->$field;
+    }
+  }
+  return $node_data;
+}
+
+/**
+ * 批量导出函数，只定义多个操作函数，每个处理若干个节点
+ */
+function batch_export_csv_v2(){
+  $operations = array();
+
+  $all_nids = batch_imexport_retrieve_list_nodes();
+  foreach ($all_nids as $nid) {
+      $operations[] = array(
+      'batch_imexport_export_list_nodes_batch_v2',
+      array($nid), //没有参数也必须写一个array，不用些$context
+    );
+  }
+
+  $batch = array(
+    'operations' => $operations,
+    'finished' => 'batch_imexport_export_list_nodes_finished',
+    // Message displayed while processing the batch. Available placeholders are:
+    // @current, @remaining, @total, @percentage, @estimate and @elapsed.
+    // These placeholders are replaced with actual values in _batch_process(),
+    // using strtr() instead of t(). The values are determined based on the
+    // number of operations in the 'operations' array (above), NOT by the number
+    // of nodes that will be processed. In this example, there are 20
+    // operations, so @total will always be 20, even though there are multiple
+    // nodes per operation.
+    // Defaults to t('Completed @current of @total.').
+    'title' => t('Exporting all node'),
+    'init_message' => t('Export is starting.'),
+    'progress_message' => t('Processed @current out of @total.'),
+    'error_message' => t('Export has encountered an error.'),
+  );
+  batch_set($batch);
+  batch_process('batch_export_download_interm/v2');
+}
+
+/**
+ * 这里同意采用这一个batch函数处理，其实可以在batch_export_csv中
+ * 对每个node（或多个）生成一个operation，
+ * 这样在界面上展示比较好
+ * Batch operation to export list subscribers.
+ */
+function batch_imexport_export_list_nodes_batch_v2($nid,&$context) {
+
+  // Create the CSV file with the appropriate column headers for this
+  // list/network if it hasn't been created yet, and store the file path and
+  // field data in the $context for later retrieval.
+  if (!isset($context['results']['file'])) {
+
+    // Get field names for this list/network. (I use a helper function here).
+    $field_labels = array(
+      'node title',
+      'node body',
+      'node nid',
+      'Created',
+    );
+
+    // Create the file and print the labels in the header row.
+    $filename = 'list_all_nodes_export.csv';
+    $file_path = file_directory_temp() . '/' . $filename;
+    $handle = fopen($file_path, 'w'); // Create the file.
+    fputcsv($handle, $field_labels); // Write the labels to the header row.
+    fclose($handle);
+
+    $fields = array(
+    	'title',
+        'body',//body后面需要特殊处理下
+        'nid',
+        'created',
+    );
+    // sandbox在每个单独的operation下连续调用时保存上下文，不同operation之间不可以用sandbox
+    $context['results']['fields'] = $fields;
+    $context['results']['filename'] = $filename;
+    $context['results']['file'] = $file_path;
+  }
+
+  // Accounting.
+  if (!isset($context['results']['count'])) {
+    $context['results']['count'] = 0;
+  }
+
+  // Open the file for writing ('a' puts pointer at end of file).
+  $handle = fopen($context['results']['file'], 'a');
+
+  // I use a helper function to get the data for each node.
+  $node_data = batch_imexport_retrieve_data_for_export($nid, $context['results']['fields']);
+  fputcsv($handle, $node_data);
+
+  // Close the file.
+  fclose($handle);
+  // count ++
+  $context['results']['count']++;
+
+  // Show message updating user on how many subscribers have been exported.
+  $context['message'] = t('Exporting [@node_title]',array('@node_title' => $node_data[0]));
+}

@@ -1,0 +1,6 @@
+;$Id$
+name = Batch import and export example
+description = Use the batch import and export functions
+package = Self Model
+core = 7.x
+
